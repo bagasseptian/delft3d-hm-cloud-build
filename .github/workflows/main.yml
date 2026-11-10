@@ -1,0 +1,150 @@
+
+name: Delft3D Windows Runner Check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    name: Check Cloud Build Environment
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    steps:
+      - name: Inspect Windows Runner
+        shell: pwsh
+        run: |
+          Write-Host "========== WINDOWS RUNNER =========="
+
+          $os = Get-CimInstance Win32_OperatingSystem
+          Write-Host "OS: $($os.Caption)"
+
+          Write-Host ""
+          Write-Host "========== HARDWARE =========="
+
+          $cpu = Get-CimInstance Win32_Processor |
+            Select-Object -First 1
+          Write-Host "CPU: $($cpu.Name)"
+          Write-Host "Logical Processors: $env:NUMBER_OF_PROCESSORS"
+
+          $ram = [math]::Round(
+            $os.TotalVisibleMemorySize / 1MB, 2
+          )
+          Write-Host "RAM: $ram GB"
+
+          Write-Host ""
+          Write-Host "========== STORAGE =========="
+
+          $disk = Get-CimInstance Win32_LogicalDisk `
+            -Filter "DeviceID='C:'"
+
+          $freeGB = [math]::Round(
+            $disk.FreeSpace / 1GB, 2
+          )
+
+          $totalGB = [math]::Round(
+            $disk.Size / 1GB, 2
+          )
+
+          Write-Host "C Drive Total: $totalGB GB"
+          Write-Host "C Drive Free: $freeGB GB"
+
+          "FREE_DISK_GB=$freeGB" |
+            Out-File -FilePath $env:GITHUB_OUTPUT `
+            -Append -Encoding utf8
+
+          Write-Host ""
+          Write-Host "========== COMPILATION TOOLS =========="
+
+          $vswhere = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            "Microsoft Visual Studio/Installer/vswhere.exe"
+
+          if (Test-Path $vswhere) {
+            $vs = & $vswhere -latest -products '*' `
+              -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+              -property installationPath
+
+            Write-Host "Visual Studio: $vs"
+          } else {
+            Write-Warning "Visual Studio installation not detected"
+          }
+
+          $cmake = Get-Command cmake `
+            -ErrorAction SilentlyContinue
+
+          if ($cmake) {
+            cmake --version
+          } else {
+            Write-Warning "CMake not found"
+          }
+
+          python --version
+          git --version
+
+          Write-Host ""
+          Write-Host "========== INTEL ONEAPI =========="
+
+          $ifx = Get-Command ifx `
+            -ErrorAction SilentlyContinue
+
+          if ($ifx) {
+            ifx --version
+          } else {
+            Write-Host "Intel Fortran IFX: Not installed"
+          }
+
+          $oneAPI = "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+
+          Write-Host "oneAPI setvars exists: $(Test-Path $oneAPI)"
+
+          Write-Host ""
+          Write-Host "========== PRE-FLIGHT COMPLETE =========="
+
+      - name: Checkout Deltares Source
+        uses: actions/checkout@v4
+        with:
+          repository: Deltares/Delft3D
+          ref: 5a4649830b1e5072caf019fb4850bbdefd9ad431
+          path: delft3d-source
+          fetch-depth: 1
+
+      - name: Verify Delft3D Source Revision
+        shell: pwsh
+        run: |
+          Set-Location "$env:GITHUB_WORKSPACE\delft3d-source"
+
+          $expected = "5a4649830b1e5072caf019fb4850bbdefd9ad431"
+          $actual = (git rev-parse HEAD).Trim()
+
+          Write-Host "Expected: $expected"
+          Write-Host "Actual:   $actual"
+
+          if ($actual -ne $expected) {
+            throw "Incorrect Delft3D source revision"
+          }
+
+          if (!(Test-Path ".\build.bat")) {
+            throw "Deltares build.bat not found"
+          }
+
+          Write-Host "build.bat: FOUND"
+
+          Write-Host ""
+          Write-Host "========== CONFIGURATIONS =========="
+
+          Select-String `
+            -Path ".\src\cmake\CMakeLists.txt" `
+            -Pattern "flow2d3d_configuration|dwaves_configuration|d3d4-suite_configuration"
+
+          Write-Host ""
+          Write-Host "CMake minimum version:"
+
+          Get-Content ".\src\cmake\CMakeLists.txt" `
+            -TotalCount 1
+
+          Write-Host ""
+          Write-Host "SOURCE VERIFICATION SUCCESSFUL"
