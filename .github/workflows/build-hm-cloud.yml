@@ -1,0 +1,397 @@
+
+name: Delft3D Full HM Cloud Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-hm:
+    name: Build Delft3D FLOW and WAVE
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+
+      # =========================================
+      # 1. CHECK CLOUD ENVIRONMENT
+      # =========================================
+      - name: Check Cloud Environment
+        shell: pwsh
+        run: |
+          $disk = Get-CimInstance Win32_LogicalDisk `
+            -Filter "DeviceID='C:'"
+
+          $free = [math]::Round(
+            $disk.FreeSpace / 1GB, 2
+          )
+
+          Write-Host "Available disk: $free GB"
+
+          if ($free -lt 35) {
+            throw "Insufficient cloud disk space."
+          }
+
+          cmake --version
+          python --version
+          git --version
+
+          $vswhere = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            "Microsoft Visual Studio/Installer/vswhere.exe"
+
+          $vs = & $vswhere -latest -products '*' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (!$vs) {
+            throw "Visual Studio 2022 C++ tools not found."
+          }
+
+          Write-Host "Visual Studio: $vs"
+
+          New-Item -ItemType Directory -Force `
+            "$env:RUNNER_TEMP\intel-logs" |
+            Out-Null
+
+      # =========================================
+      # 2. CHECKOUT DELTARES SOURCE
+      # =========================================
+      - name: Checkout Deltares Source
+        uses: actions/checkout@v7
+        with:
+          repository: Deltares/Delft3D
+          ref: 5a4649830b1e5072caf019fb4850bbdefd9ad431
+          path: Delft3D
+          fetch-depth: 1
+
+      - name: Verify Source Revision
+        shell: pwsh
+        run: |
+          Set-Location "$env:GITHUB_WORKSPACE\Delft3D"
+
+          $expected = "5a4649830b1e5072caf019fb4850bbdefd9ad431"
+          $actual = (git rev-parse HEAD).Trim()
+
+          Write-Host "Expected: $expected"
+          Write-Host "Actual: $actual"
+
+          if ($actual -ne $expected) {
+            throw "Incorrect Deltares source revision."
+          }
+
+          if (!(Test-Path ".\build.bat")) {
+            throw "Deltares build.bat missing."
+          }
+
+          Write-Host "Source revision verified."
+
+      # =========================================
+      # 3. DOWNLOAD INTEL TOOLKITS
+      # =========================================
+      - name: Download Intel Base Toolkit
+        shell: pwsh
+        run: |
+          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/e83a8e64-04fc-45df-85c6-c2208d03bdb5/w_BaseKit_p_2024.2.0.635_offline.exe"
+
+          $file = "$env:RUNNER_TEMP\basekit.exe"
+
+          curl.exe -L --fail --retry 3 `
+            -o $file $url
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Intel Base download failed."
+          }
+
+          Write-Host "Base Toolkit downloaded."
+
+      - name: Download Intel HPC Toolkit
+        shell: pwsh
+        run: |
+          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/0d500705-397e-41b3-8b2b-2a3da1753fc2/w_HPCKit_p_2024.2.0.633_offline.exe"
+
+          $file = "$env:RUNNER_TEMP\hpckit.exe"
+
+          curl.exe -L --fail --retry 3 `
+            -o $file $url
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Intel HPC download failed."
+          }
+
+          Write-Host "HPC Toolkit downloaded."
+
+      # =========================================
+      # 4. INSTALL INTEL MKL
+      # =========================================
+      - name: Install Intel oneMKL
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\basekit.exe"
+          $log = "$env:RUNNER_TEMP\intel-logs\base"
+
+          $installerArgs = @(
+            "-s",
+            "-a",
+            "--silent",
+            "--eula",
+            "accept",
+            "--action",
+            "install",
+            "--components",
+            "intel.oneapi.win.mkl.devel",
+            "-p=NEED_VS2022_INTEGRATION=0"
+          )
+
+          $proc = Start-Process `
+            -FilePath $exe `
+            -ArgumentList $installerArgs `
+            -Wait `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput "$log-out.txt" `
+            -RedirectStandardError "$log-error.txt"
+
+          Get-Content "$log-out.txt" `
+            -ErrorAction SilentlyContinue
+
+          Get-Content "$log-error.txt" `
+            -ErrorAction SilentlyContinue
+
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            throw "oneMKL installation failed: $($proc.ExitCode)"
+          }
+
+          Write-Host "oneMKL installation completed."
+
+      # =========================================
+      # 5. INSTALL INTEL FORTRAN + MPI
+      # =========================================
+      - name: Install Intel Fortran and MPI
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\hpckit.exe"
+          $log = "$env:RUNNER_TEMP\intel-logs\hpc"
+
+          $components = "intel.oneapi.win.mpi.devel:intel.oneapi.win.ifort-compiler"
+
+          $installerArgs = @(
+            "-s",
+            "-a",
+            "--silent",
+            "--eula",
+            "accept",
+            "--action",
+            "install",
+            "--components",
+            $components,
+            "-p=NEED_VS2022_INTEGRATION=0"
+          )
+
+          $proc = Start-Process `
+            -FilePath $exe `
+            -ArgumentList $installerArgs `
+            -Wait `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput "$log-out.txt" `
+            -RedirectStandardError "$log-error.txt"
+
+          Get-Content "$log-out.txt" `
+            -ErrorAction SilentlyContinue
+
+          Get-Content "$log-error.txt" `
+            -ErrorAction SilentlyContinue
+
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            throw "Fortran/MPI installation failed: $($proc.ExitCode)"
+          }
+
+          Write-Host "Fortran and MPI installation completed."
+
+      # =========================================
+      # 6. VERIFY INTEL TOOLCHAIN
+      # =========================================
+      - name: Verify Intel Toolchain
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 vs2022
+
+          if errorlevel 1 exit /b 1
+
+          echo ===== IFX =====
+          where ifx
+
+          if errorlevel 1 exit /b 1
+
+          cd /d "%RUNNER_TEMP%"
+
+          > hello.f90 echo program hello
+          >> hello.f90 echo print *, "IFX_COMPILE_OK"
+          >> hello.f90 echo end program hello
+
+          ifx hello.f90
+          if errorlevel 1 exit /b 1
+
+          hello.exe
+          if errorlevel 1 exit /b 1
+
+          echo ===== MPI =====
+          where mpiexec
+          if errorlevel 1 exit /b 1
+
+          mpiexec -version
+          if errorlevel 1 exit /b 1
+
+          echo ===== TOOLCHAIN OK =====
+
+      - name: Verify Intel MKL
+        shell: pwsh
+        run: |
+          $root = "C:\Program Files (x86)\Intel\oneAPI\mkl"
+
+          $header = Get-ChildItem `
+            -Path $root `
+            -Filter "mkl.h" `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (!$header) {
+            throw "MKL header mkl.h not found."
+          }
+
+          Write-Host "MKL verified: $($header.FullName)"
+
+      # =========================================
+      # 7. BUILD FLOW + MORPHOLOGY
+      # =========================================
+      - name: Build FLOW and Morphology
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 vs2022
+
+          if errorlevel 1 exit /b 1
+
+          cd /d "%GITHUB_WORKSPACE%\Delft3D"
+
+          set "CMAKE_BUILD_PARALLEL_LEVEL=1"
+
+          echo ===== BUILD FLOW2D3D =====
+
+          call build.bat -config flow2d3d -build_type Release -build
+
+          if errorlevel 1 (
+            echo FLOW BUILD FAILED
+            exit /b 1
+          )
+
+          if not exist "install_flow2d3d" (
+            echo FLOW INSTALL DIRECTORY MISSING
+            exit /b 1
+          )
+
+          echo FLOW BUILD SUCCESSFUL
+
+      # =========================================
+      # 8. BUILD WAVE
+      # =========================================
+      - name: Build WAVE and SWAN
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 vs2022
+
+          if errorlevel 1 exit /b 1
+
+          cd /d "%GITHUB_WORKSPACE%\Delft3D"
+
+          set "CMAKE_BUILD_PARALLEL_LEVEL=1"
+
+          echo ===== BUILD DWAVES =====
+
+          call build.bat -config dwaves -build_type Release -build
+
+          if errorlevel 1 (
+            echo WAVE BUILD FAILED
+            exit /b 1
+          )
+
+          if not exist "install_dwaves" (
+            echo WAVE INSTALL DIRECTORY MISSING
+            exit /b 1
+          )
+
+          echo WAVE BUILD SUCCESSFUL
+
+      # =========================================
+      # 9. CREATE BUILD SUMMARY
+      # =========================================
+      - name: Inspect Build Outputs
+        if: always()
+        shell: pwsh
+        run: |
+          $root = "$env:GITHUB_WORKSPACE\Delft3D"
+
+          $summary = "$env:RUNNER_TEMP\delft3d-build-summary.txt"
+
+          "DELFT3D FULL HM BUILD SUMMARY" |
+            Set-Content $summary
+
+          foreach ($name in @(
+            "install_flow2d3d",
+            "install_dwaves",
+            "build_flow2d3d",
+            "build_dwaves"
+          )) {
+            $dir = Join-Path $root $name
+
+            "`n===== $name =====" |
+              Add-Content $summary
+
+            if (Test-Path $dir) {
+              Get-ChildItem $dir -Recurse -File |
+                Select-Object FullName, Length |
+                Out-String |
+                Add-Content $summary
+            } else {
+              "DIRECTORY NOT FOUND" |
+                Add-Content $summary
+            }
+          }
+
+          Get-Content $summary
+
+      # =========================================
+      # 10. UPLOAD BUILD ARTIFACTS AND LOGS
+      # =========================================
+      - name: Upload Delft3D Build Results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: delft3d-40702-windows-full-hm
+          path: |
+            Delft3D/install_flow2d3d/
+            Delft3D/install_dwaves/
+            Delft3D/build_flow2d3d/*.log
+            Delft3D/build_dwaves/*.log
+            ${{ runner.temp }}/intel-logs/
+            ${{ runner.temp }}/delft3d-build-summary.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      # =========================================
+      # 11. CLEANUP INSTALLERS
+      # =========================================
+      - name: Cleanup Intel Installers
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item "$env:RUNNER_TEMP\basekit.exe" `
+            -Force -ErrorAction SilentlyContinue
+
+          Remove-Item "$env:RUNNER_TEMP\hpckit.exe" `
+            -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Temporary installers cleaned."
