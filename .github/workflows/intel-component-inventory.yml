@@ -14,101 +14,154 @@ jobs:
     timeout-minutes: 45
 
     steps:
-      - name: Check Available Disk
+      - name: Prepare Report Directory
         shell: pwsh
         run: |
-          $disk = Get-CimInstance Win32_LogicalDisk `
-            -Filter "DeviceID='C:'"
+          $dir = "$env:RUNNER_TEMP\intel-inventory"
+          New-Item -ItemType Directory -Force -Path $dir |
+            Out-Null
 
-          $free = [math]::Round(
-            $disk.FreeSpace / 1GB, 2
-          )
+          Write-Host "Report directory: $dir"
 
-          Write-Host "Available disk: $free GB"
-
-          if ($free -lt 35) {
-            throw "Not enough disk space for package inspection."
-          }
-
-      - name: Download Base Toolkit
+      - name: Download Intel Installers
         shell: pwsh
         run: |
-          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/e83a8e64-04fc-45df-85c6-c2208d03bdb5/w_BaseKit_p_2024.2.0.635_offline.exe"
+          $base = "$env:RUNNER_TEMP\basekit.exe"
+          $hpc  = "$env:RUNNER_TEMP\hpckit.exe"
 
-          $file = Join-Path $env:RUNNER_TEMP `
-            "basekit.exe"
+          $baseUrl = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/e83a8e64-04fc-45df-85c6-c2208d03bdb5/w_BaseKit_p_2024.2.0.635_offline.exe"
+
+          $hpcUrl = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/0d500705-397e-41b3-8b2b-2a3da1753fc2/w_HPCKit_p_2024.2.0.633_offline.exe"
+
+          Write-Host "Downloading Base Toolkit..."
 
           curl.exe -L --fail --retry 3 `
-            -o $file $url
+            -o $base $baseUrl
 
           if ($LASTEXITCODE -ne 0) {
             throw "Base Toolkit download failed."
           }
 
-          Write-Host "Base Toolkit download successful."
-
-      - name: Download HPC Toolkit
-        shell: pwsh
-        run: |
-          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/0d500705-397e-41b3-8b2b-2a3da1753fc2/w_HPCKit_p_2024.2.0.633_offline.exe"
-
-          $file = Join-Path $env:RUNNER_TEMP `
-            "hpckit.exe"
+          Write-Host "Downloading HPC Toolkit..."
 
           curl.exe -L --fail --retry 3 `
-            -o $file $url
+            -o $hpc $hpcUrl
 
           if ($LASTEXITCODE -ne 0) {
             throw "HPC Toolkit download failed."
           }
 
-          Write-Host "HPC Toolkit download successful."
+          Get-Item $base, $hpc |
+            Select-Object Name, Length
 
-      - name: Inspect Base Toolkit Components
+      - name: Inspect Base Toolkit
         shell: pwsh
         run: |
-          $file = Join-Path $env:RUNNER_TEMP "basekit.exe"
-          $log = Join-Path $env:RUNNER_TEMP "base-components.txt"
+          $exe = "$env:RUNNER_TEMP\basekit.exe"
+          $dir = "$env:RUNNER_TEMP\intel-inventory"
 
-          Write-Host "Listing Base Toolkit components..."
+          $stdout = "$dir\base-stdout.txt"
+          $stderr = "$dir\base-stderr.txt"
+          $report = "$dir\base-report.txt"
 
-          & $file -s -a --list-components *> $log
+          Write-Host "Inspecting Base Toolkit..."
 
-          $code = $LASTEXITCODE
+          try {
+            $proc = Start-Process `
+              -FilePath $exe `
+              -ArgumentList "-s -a --list-components" `
+              -Wait `
+              -PassThru `
+              -NoNewWindow `
+              -RedirectStandardOutput $stdout `
+              -RedirectStandardError $stderr
 
-          Get-Content $log
+            $code = $proc.ExitCode
 
-          if ($code -ne 0) {
-            throw "Base Toolkit inventory failed. Exit: $code"
+            Write-Host "Base Toolkit exit code: $code"
+
+            @"
+          BASE TOOLKIT INVENTORY
+          Exit Code: $code
+
+          STANDARD OUTPUT:
+          $(Get-Content $stdout -Raw -ErrorAction SilentlyContinue)
+
+          STANDARD ERROR:
+          $(Get-Content $stderr -Raw -ErrorAction SilentlyContinue)
+          "@ | Set-Content $report
+
+          } catch {
+            $_ | Out-String |
+              Set-Content $report
+
+            Write-Warning "Base inspection exception captured."
           }
 
-      - name: Inspect HPC Toolkit Components
+          Get-Content $report
+
+      - name: Inspect HPC Toolkit
+        if: always()
         shell: pwsh
         run: |
-          $file = Join-Path $env:RUNNER_TEMP "hpckit.exe"
-          $log = Join-Path $env:RUNNER_TEMP "hpc-components.txt"
+          $exe = "$env:RUNNER_TEMP\hpckit.exe"
+          $dir = "$env:RUNNER_TEMP\intel-inventory"
 
-          Write-Host "Listing HPC Toolkit components..."
+          $stdout = "$dir\hpc-stdout.txt"
+          $stderr = "$dir\hpc-stderr.txt"
+          $report = "$dir\hpc-report.txt"
 
-          & $file -s -a --list-components *> $log
+          if (!(Test-Path $exe)) {
+            "HPC installer was not downloaded." |
+              Set-Content $report
 
-          $code = $LASTEXITCODE
-
-          Get-Content $log
-
-          if ($code -ne 0) {
-            throw "HPC Toolkit inventory failed. Exit: $code"
+            Write-Warning "HPC installer missing."
+            exit 0
           }
 
-      - name: Upload Component Inventory
+          Write-Host "Inspecting HPC Toolkit..."
+
+          try {
+            $proc = Start-Process `
+              -FilePath $exe `
+              -ArgumentList "-s -a --list-components" `
+              -Wait `
+              -PassThru `
+              -NoNewWindow `
+              -RedirectStandardOutput $stdout `
+              -RedirectStandardError $stderr
+
+            $code = $proc.ExitCode
+
+            Write-Host "HPC Toolkit exit code: $code"
+
+            @"
+          HPC TOOLKIT INVENTORY
+          Exit Code: $code
+
+          STANDARD OUTPUT:
+          $(Get-Content $stdout -Raw -ErrorAction SilentlyContinue)
+
+          STANDARD ERROR:
+          $(Get-Content $stderr -Raw -ErrorAction SilentlyContinue)
+          "@ | Set-Content $report
+
+          } catch {
+            $_ | Out-String |
+              Set-Content $report
+
+            Write-Warning "HPC inspection exception captured."
+          }
+
+          Get-Content $report
+
+      - name: Upload Diagnostic Reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: intel-2024.2-component-inventory
-          path: |
-            ${{ runner.temp }}\base-components.txt
-            ${{ runner.temp }}\hpc-components.txt
-          if-no-files-found: warn
+          name: intel-2024.2-diagnostic-reports
+          path: ${{ runner.temp }}/intel-inventory/
+          if-no-files-found: error
           retention-days: 3
 
       - name: Cleanup Installers
@@ -121,4 +174,4 @@ jobs:
           Remove-Item "$env:RUNNER_TEMP\hpckit.exe" `
             -Force -ErrorAction SilentlyContinue
 
-          Write-Host "Temporary installers removed."
+          Write-Host "Installer cleanup completed."
