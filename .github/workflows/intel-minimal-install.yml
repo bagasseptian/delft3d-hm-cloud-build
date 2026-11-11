@@ -1,0 +1,211 @@
+
+name: Intel oneAPI 2024.2 Minimal Install
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: Install Required Intel Components
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Preflight
+        shell: pwsh
+        run: |
+          $disk = Get-CimInstance Win32_LogicalDisk `
+            -Filter "DeviceID='C:'"
+
+          $free = [math]::Round(
+            $disk.FreeSpace / 1GB, 2
+          )
+
+          Write-Host "Available disk: $free GB"
+
+          if ($free -lt 35) {
+            throw "Insufficient disk space."
+          }
+
+          New-Item -ItemType Directory -Force `
+            "$env:RUNNER_TEMP\intel-logs" |
+            Out-Null
+
+      - name: Download Intel Installers
+        shell: pwsh
+        run: |
+          $baseUrl = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/e83a8e64-04fc-45df-85c6-c2208d03bdb5/w_BaseKit_p_2024.2.0.635_offline.exe"
+
+          $hpcUrl = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/0d500705-397e-41b3-8b2b-2a3da1753fc2/w_HPCKit_p_2024.2.0.633_offline.exe"
+
+          curl.exe -L --fail --retry 3 `
+            -o "$env:RUNNER_TEMP\basekit.exe" $baseUrl
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Base download failed."
+          }
+
+          curl.exe -L --fail --retry 3 `
+            -o "$env:RUNNER_TEMP\hpckit.exe" $hpcUrl
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "HPC download failed."
+          }
+
+          Write-Host "Both installers downloaded."
+
+      - name: Install Intel oneMKL Only
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\basekit.exe"
+          $log = "$env:RUNNER_TEMP\intel-logs\base-install"
+
+          Write-Host "Installing selected oneMKL component..."
+
+          $args = @(
+            "-s",
+            "-a",
+            "--silent",
+            "--eula",
+            "accept",
+            "--action",
+            "install",
+            "--components",
+            "intel.oneapi.win.mkl.devel",
+            "-p=NEED_VS2022_INTEGRATION=0"
+          )
+
+          $proc = Start-Process `
+            -FilePath $exe `
+            -ArgumentList $args `
+            -Wait `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput "$log-stdout.txt" `
+            -RedirectStandardError "$log-stderr.txt"
+
+          "Base Toolkit Exit Code: $($proc.ExitCode)" |
+            Set-Content "$log-status.txt"
+
+          Get-Content "$log-stdout.txt" `
+            -ErrorAction SilentlyContinue
+
+          Get-Content "$log-stderr.txt" `
+            -ErrorAction SilentlyContinue
+
+          if ($proc.ExitCode -ne 0) {
+            throw "oneMKL installation failed: $($proc.ExitCode)"
+          }
+
+      - name: Verify oneMKL
+        shell: pwsh
+        run: |
+          $root = "C:\Program Files (x86)\Intel\oneAPI\mkl"
+
+          if (!(Test-Path $root)) {
+            throw "oneMKL installation directory missing."
+          }
+
+          $header = Get-ChildItem `
+            -Path $root `
+            -Filter "mkl.h" `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (!$header) {
+            throw "mkl.h was not found."
+          }
+
+          Write-Host "oneMKL verified:"
+          Write-Host $header.FullName
+
+      - name: Install Intel Fortran and MPI
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\hpckit.exe"
+          $log = "$env:RUNNER_TEMP\intel-logs\hpc-install"
+
+          Write-Host "Installing Intel Fortran and MPI..."
+
+          $components = "intel.oneapi.win.mpi.devel:intel.oneapi.win.ifort-compiler"
+
+          $args = @(
+            "-s",
+            "-a",
+            "--silent",
+            "--eula",
+            "accept",
+            "--action",
+            "install",
+            "--components",
+            $components,
+            "-p=NEED_VS2022_INTEGRATION=0"
+          )
+
+          $proc = Start-Process `
+            -FilePath $exe `
+            -ArgumentList $args `
+            -Wait `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput "$log-stdout.txt" `
+            -RedirectStandardError "$log-stderr.txt"
+
+          "HPC Toolkit Exit Code: $($proc.ExitCode)" |
+            Set-Content "$log-status.txt"
+
+          Get-Content "$log-stdout.txt" `
+            -ErrorAction SilentlyContinue
+
+          Get-Content "$log-stderr.txt" `
+            -ErrorAction SilentlyContinue
+
+          if ($proc.ExitCode -ne 0) {
+            throw "Fortran/MPI installation failed: $($proc.ExitCode)"
+          }
+
+      - name: Verify IFX MPI and MKL
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64
+
+          if errorlevel 1 exit /b 1
+
+          echo ===== IFX =====
+          where ifx
+          ifx --version
+
+          if errorlevel 1 exit /b 1
+
+          echo ===== MPI =====
+          where mpiexec
+          mpiexec -version
+
+          if errorlevel 1 exit /b 1
+
+          echo ===== TOOLCHAIN VERIFIED =====
+
+      - name: Upload Installation Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: intel-minimal-install-logs
+          path: ${{ runner.temp }}\intel-logs\
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Cleanup Installers
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item "$env:RUNNER_TEMP\basekit.exe" `
+            -Force -ErrorAction SilentlyContinue
+
+          Remove-Item "$env:RUNNER_TEMP\hpckit.exe" `
+            -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Cleanup completed."
