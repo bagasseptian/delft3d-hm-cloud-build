@@ -168,7 +168,60 @@ jobs:
             throw "Fortran/MPI installation failed: $($proc.ExitCode)"
           }
 
+      
       - name: Verify IFX MPI and MKL
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 vs2022
+          if errorlevel 1 exit /b 1
+
+          echo.
+          echo ===== CHECK IFX LOCATION =====
+          where ifx
+          if errorlevel 1 exit /b 1
+
+          echo.
+          echo ===== TEST FORTRAN COMPILATION =====
+
+          set "TESTDIR=%RUNNER_TEMP%\ifx-smoke-test"
+
+          if not exist "%TESTDIR%" mkdir "%TESTDIR%"
+
+          cd /d "%TESTDIR%"
+
+          > hello.f90 echo print *, "IFX_COMPILE_OK"
+          >> hello.f90 echo end
+
+          ifx hello.f90
+          if errorlevel 1 exit /b 1
+
+          if not exist hello.exe exit /b 1
+
+          hello.exe
+          if errorlevel 1 exit /b 1
+
+          echo.
+          echo ===== CHECK INTEL MPI =====
+
+          where mpiexec
+          if errorlevel 1 exit /b 1
+
+          mpiexec -version
+          if errorlevel 1 exit /b 1
+
+          echo.
+          echo ===== CHECK INTEL MKL =====
+
+          if exist "C:\Program Files (x86)\Intel\oneAPI\mkl\latest\include\mkl.h" (
+            echo MKL HEADER FOUND
+          ) else (
+            echo MKL HEADER NOT FOUND
+            exit /b 1
+          )
+
+          echo.
+          echo ===== ALL INTEL COMPONENTS VERIFIED =====
+
         shell: cmd
         run: |
           call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64
