@@ -1,0 +1,124 @@
+
+name: Intel oneAPI 2024.2 Component Inventory
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    name: Inspect Intel Toolkit Packages
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Check Available Disk
+        shell: pwsh
+        run: |
+          $disk = Get-CimInstance Win32_LogicalDisk `
+            -Filter "DeviceID='C:'"
+
+          $free = [math]::Round(
+            $disk.FreeSpace / 1GB, 2
+          )
+
+          Write-Host "Available disk: $free GB"
+
+          if ($free -lt 35) {
+            throw "Not enough disk space for package inspection."
+          }
+
+      - name: Download Base Toolkit
+        shell: pwsh
+        run: |
+          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/e83a8e64-04fc-45df-85c6-c2208d03bdb5/w_BaseKit_p_2024.2.0.635_offline.exe"
+
+          $file = Join-Path $env:RUNNER_TEMP `
+            "basekit.exe"
+
+          curl.exe -L --fail --retry 3 `
+            -o $file $url
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Base Toolkit download failed."
+          }
+
+          Write-Host "Base Toolkit download successful."
+
+      - name: Download HPC Toolkit
+        shell: pwsh
+        run: |
+          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/0d500705-397e-41b3-8b2b-2a3da1753fc2/w_HPCKit_p_2024.2.0.633_offline.exe"
+
+          $file = Join-Path $env:RUNNER_TEMP `
+            "hpckit.exe"
+
+          curl.exe -L --fail --retry 3 `
+            -o $file $url
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "HPC Toolkit download failed."
+          }
+
+          Write-Host "HPC Toolkit download successful."
+
+      - name: Inspect Base Toolkit Components
+        shell: pwsh
+        run: |
+          $file = Join-Path $env:RUNNER_TEMP "basekit.exe"
+          $log = Join-Path $env:RUNNER_TEMP "base-components.txt"
+
+          Write-Host "Listing Base Toolkit components..."
+
+          & $file -s -a --list-components *> $log
+
+          $code = $LASTEXITCODE
+
+          Get-Content $log
+
+          if ($code -ne 0) {
+            throw "Base Toolkit inventory failed. Exit: $code"
+          }
+
+      - name: Inspect HPC Toolkit Components
+        shell: pwsh
+        run: |
+          $file = Join-Path $env:RUNNER_TEMP "hpckit.exe"
+          $log = Join-Path $env:RUNNER_TEMP "hpc-components.txt"
+
+          Write-Host "Listing HPC Toolkit components..."
+
+          & $file -s -a --list-components *> $log
+
+          $code = $LASTEXITCODE
+
+          Get-Content $log
+
+          if ($code -ne 0) {
+            throw "HPC Toolkit inventory failed. Exit: $code"
+          }
+
+      - name: Upload Component Inventory
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: intel-2024.2-component-inventory
+          path: |
+            ${{ runner.temp }}\base-components.txt
+            ${{ runner.temp }}\hpc-components.txt
+          if-no-files-found: warn
+          retention-days: 3
+
+      - name: Cleanup Installers
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item "$env:RUNNER_TEMP\basekit.exe" `
+            -Force -ErrorAction SilentlyContinue
+
+          Remove-Item "$env:RUNNER_TEMP\hpckit.exe" `
+            -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Temporary installers removed."
