@@ -14,9 +14,14 @@ jobs:
     timeout-minutes: 120
 
     steps:
+      # ==========================================
+      # 1. PREFLIGHT
+      # ==========================================
       - name: Preflight
         shell: pwsh
         run: |
+          Write-Host "========== PREFLIGHT =========="
+
           $disk = Get-CimInstance Win32_LogicalDisk `
             -Filter "DeviceID='C:'"
 
@@ -30,10 +35,16 @@ jobs:
             throw "Insufficient disk space."
           }
 
-          New-Item -ItemType Directory -Force `
-            "$env:RUNNER_TEMP\intel-logs" |
-            Out-Null
+          $logDir = "$env:RUNNER_TEMP\intel-logs"
 
+          New-Item -ItemType Directory -Force `
+            -Path $logDir | Out-Null
+
+          Write-Host "Preflight successful."
+
+      # ==========================================
+      # 2. DOWNLOAD INSTALLERS
+      # ==========================================
       - name: Download Intel Installers
         shell: pwsh
         run: |
@@ -41,31 +52,44 @@ jobs:
 
           $hpcUrl = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/0d500705-397e-41b3-8b2b-2a3da1753fc2/w_HPCKit_p_2024.2.0.633_offline.exe"
 
-          curl.exe -L --fail --retry 3 `
-            -o "$env:RUNNER_TEMP\basekit.exe" $baseUrl
+          $baseFile = "$env:RUNNER_TEMP\basekit.exe"
+          $hpcFile = "$env:RUNNER_TEMP\hpckit.exe"
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Base download failed."
-          }
+          Write-Host "Downloading Base Toolkit..."
 
           curl.exe -L --fail --retry 3 `
-            -o "$env:RUNNER_TEMP\hpckit.exe" $hpcUrl
+            -o $baseFile $baseUrl
 
           if ($LASTEXITCODE -ne 0) {
-            throw "HPC download failed."
+            throw "Base Toolkit download failed."
           }
 
-          Write-Host "Both installers downloaded."
+          Write-Host "Downloading HPC Toolkit..."
 
-      - name: Install Intel oneMKL Only
+          curl.exe -L --fail --retry 3 `
+            -o $hpcFile $hpcUrl
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "HPC Toolkit download failed."
+          }
+
+          Get-Item $baseFile, $hpcFile |
+            Select-Object Name, Length
+
+          Write-Host "Both installers downloaded successfully."
+
+      # ==========================================
+      # 3. INSTALL INTEL MKL
+      # ==========================================
+      - name: Install Intel oneMKL
         shell: pwsh
         run: |
           $exe = "$env:RUNNER_TEMP\basekit.exe"
           $log = "$env:RUNNER_TEMP\intel-logs\base-install"
 
-          Write-Host "Installing selected oneMKL component..."
+          Write-Host "Installing Intel oneMKL..."
 
-          $args = @(
+          $installerArgs = @(
             "-s",
             "-a",
             "--silent",
@@ -80,15 +104,14 @@ jobs:
 
           $proc = Start-Process `
             -FilePath $exe `
-            -ArgumentList $args `
+            -ArgumentList $installerArgs `
             -Wait `
             -PassThru `
             -NoNewWindow `
             -RedirectStandardOutput "$log-stdout.txt" `
             -RedirectStandardError "$log-stderr.txt"
 
-          "Base Toolkit Exit Code: $($proc.ExitCode)" |
-            Set-Content "$log-status.txt"
+          Write-Host "Base installer exit code: $($proc.ExitCode)"
 
           Get-Content "$log-stdout.txt" `
             -ErrorAction SilentlyContinue
@@ -96,33 +119,15 @@ jobs:
           Get-Content "$log-stderr.txt" `
             -ErrorAction SilentlyContinue
 
-          if ($proc.ExitCode -ne 0) {
-            throw "oneMKL installation failed: $($proc.ExitCode)"
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            throw "Intel oneMKL installation failed: $($proc.ExitCode)"
           }
 
-      - name: Verify oneMKL
-        shell: pwsh
-        run: |
-          $root = "C:\Program Files (x86)\Intel\oneAPI\mkl"
+          Write-Host "Intel oneMKL installation completed."
 
-          if (!(Test-Path $root)) {
-            throw "oneMKL installation directory missing."
-          }
-
-          $header = Get-ChildItem `
-            -Path $root `
-            -Filter "mkl.h" `
-            -Recurse `
-            -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-
-          if (!$header) {
-            throw "mkl.h was not found."
-          }
-
-          Write-Host "oneMKL verified:"
-          Write-Host $header.FullName
-
+      # ==========================================
+      # 4. INSTALL INTEL FORTRAN + MPI
+      # ==========================================
       - name: Install Intel Fortran and MPI
         shell: pwsh
         run: |
@@ -133,7 +138,7 @@ jobs:
 
           $components = "intel.oneapi.win.mpi.devel:intel.oneapi.win.ifort-compiler"
 
-          $args = @(
+          $installerArgs = @(
             "-s",
             "-a",
             "--silent",
@@ -148,15 +153,14 @@ jobs:
 
           $proc = Start-Process `
             -FilePath $exe `
-            -ArgumentList $args `
+            -ArgumentList $installerArgs `
             -Wait `
             -PassThru `
             -NoNewWindow `
             -RedirectStandardOutput "$log-stdout.txt" `
             -RedirectStandardError "$log-stderr.txt"
 
-          "HPC Toolkit Exit Code: $($proc.ExitCode)" |
-            Set-Content "$log-status.txt"
+          Write-Host "HPC installer exit code: $($proc.ExitCode)"
 
           Get-Content "$log-stdout.txt" `
             -ErrorAction SilentlyContinue
@@ -164,24 +168,36 @@ jobs:
           Get-Content "$log-stderr.txt" `
             -ErrorAction SilentlyContinue
 
-          if ($proc.ExitCode -ne 0) {
-            throw "Fortran/MPI installation failed: $($proc.ExitCode)"
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            throw "Intel Fortran/MPI installation failed: $($proc.ExitCode)"
           }
 
-      
+          Write-Host "Intel Fortran and MPI installation completed."
+
+      # ==========================================
+      # 5. VERIFY INTEL TOOLCHAIN
+      # ==========================================
       - name: Verify IFX MPI and MKL
         shell: cmd
         run: |
+          @echo on
+
           call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 vs2022
+
           if errorlevel 1 exit /b 1
 
           echo.
-          echo ===== CHECK IFX LOCATION =====
+          echo =================================
+          echo CHECK INTEL FORTRAN COMPILER
+          echo =================================
+
           where ifx
           if errorlevel 1 exit /b 1
 
           echo.
-          echo ===== TEST FORTRAN COMPILATION =====
+          echo =================================
+          echo TEST FORTRAN COMPILATION
+          echo =================================
 
           set "TESTDIR=%RUNNER_TEMP%\ifx-smoke-test"
 
@@ -193,55 +209,61 @@ jobs:
           >> hello.f90 echo end
 
           ifx hello.f90
+
           if errorlevel 1 exit /b 1
 
           if not exist hello.exe exit /b 1
 
-          hello.exe
+          "%TESTDIR%\hello.exe"
+
           if errorlevel 1 exit /b 1
 
           echo.
-          echo ===== CHECK INTEL MPI =====
+          echo =================================
+          echo CHECK INTEL MPI
+          echo =================================
 
           where mpiexec
           if errorlevel 1 exit /b 1
 
           mpiexec -version
+
           if errorlevel 1 exit /b 1
 
           echo.
-          echo ===== CHECK INTEL MKL =====
+          echo =================================
+          echo INTEL TOOLCHAIN BASIC CHECK OK
+          echo =================================
 
-          if exist "C:\Program Files (x86)\Intel\oneAPI\mkl\latest\include\mkl.h" (
-            echo MKL HEADER FOUND
-          ) else (
-            echo MKL HEADER NOT FOUND
-            exit /b 1
-          )
-
-          echo.
-          echo ===== ALL INTEL COMPONENTS VERIFIED =====
-
-        shell: cmd
+      # ==========================================
+      # 6. VERIFY MKL
+      # ==========================================
+      - name: Verify Intel oneMKL
+        shell: pwsh
         run: |
-          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64
+          $root = "C:\Program Files (x86)\Intel\oneAPI\mkl"
 
-          if errorlevel 1 exit /b 1
+          if (!(Test-Path $root)) {
+            throw "oneMKL directory not found."
+          }
 
-          echo ===== IFX =====
-          where ifx
-          ifx --version
+          $header = Get-ChildItem `
+            -Path $root `
+            -Filter "mkl.h" `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
 
-          if errorlevel 1 exit /b 1
+          if (!$header) {
+            throw "Intel oneMKL header mkl.h not found."
+          }
 
-          echo ===== MPI =====
-          where mpiexec
-          mpiexec -version
+          Write-Host "Intel oneMKL verified:"
+          Write-Host $header.FullName
 
-          if errorlevel 1 exit /b 1
-
-          echo ===== TOOLCHAIN VERIFIED =====
-
+      # ==========================================
+      # 7. UPLOAD LOGS
+      # ==========================================
       - name: Upload Installation Logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -251,6 +273,9 @@ jobs:
           if-no-files-found: warn
           retention-days: 3
 
+      # ==========================================
+      # 8. CLEANUP
+      # ==========================================
       - name: Cleanup Installers
         if: always()
         shell: pwsh
