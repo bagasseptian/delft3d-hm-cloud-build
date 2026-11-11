@@ -1,0 +1,233 @@
+
+name: Intel oneAPI 2024.2 Install and Verify
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  install-intel:
+    name: Install Intel Fortran MPI MKL
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Preflight Visual Studio and Storage
+        shell: pwsh
+        run: |
+          Write-Host "========== PREFLIGHT =========="
+
+          $disk = Get-CimInstance Win32_LogicalDisk `
+            -Filter "DeviceID='C:'"
+
+          $free = [math]::Round(
+            $disk.FreeSpace / 1GB, 2
+          )
+
+          Write-Host "Free disk: $free GB"
+
+          if ($free -lt 35) {
+            throw "Insufficient free disk space for oneAPI installation."
+          }
+
+          $vswhere = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            "Microsoft Visual Studio/Installer/vswhere.exe"
+
+          if (!(Test-Path $vswhere)) {
+            throw "Visual Studio Installer/vswhere not found."
+          }
+
+          $vsPath = & $vswhere -latest -products '*' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (!$vsPath) {
+            throw "MSVC x64 C++ Build Tools not detected."
+          }
+
+          $vsVersion = & $vswhere -latest -products '*' `
+            -property installationVersion
+
+          Write-Host "Visual Studio: $vsPath"
+          Write-Host "VS Version: $vsVersion"
+
+          $components = @(
+            "Microsoft.VisualStudio.Component.VC.CLI.Support",
+            "Microsoft.VisualStudio.Component.VC.ATLMFC"
+          )
+
+          foreach ($component in $components) {
+            $found = & $vswhere -latest -products '*' `
+              -requires $component -property installationPath
+
+            if ($found) {
+              Write-Host "$component : FOUND"
+            } else {
+              Write-Warning "$component : NOT DETECTED"
+            }
+          }
+
+          cmake --version
+          python --version
+          git --version
+
+      - name: Download Intel Base Toolkit 2024.2
+        shell: pwsh
+        run: |
+          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/e83a8e64-04fc-45df-85c6-c2208d03bdb5/w_BaseKit_p_2024.2.0.635_offline.exe"
+
+          $file = Join-Path $env:RUNNER_TEMP `
+            "w_BaseKit_p_2024.2.0.635_offline.exe"
+
+          Write-Host "Downloading Intel Base Toolkit..."
+
+          curl.exe -L --fail --retry 3 `
+            -o $file $url
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Base Toolkit download failed."
+          }
+
+          Write-Host "Downloaded:"
+          Get-Item $file |
+            Select-Object Name, Length
+
+      - name: Download Intel HPC Toolkit 2024.2
+        shell: pwsh
+        run: |
+          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/0d500705-397e-41b3-8b2b-2a3da1753fc2/w_HPCKit_p_2024.2.0.633_offline.exe"
+
+          $file = Join-Path $env:RUNNER_TEMP `
+            "w_HPCKit_p_2024.2.0.633_offline.exe"
+
+          Write-Host "Downloading Intel HPC Toolkit..."
+
+          curl.exe -L --fail --retry 3 `
+            -o $file $url
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "HPC Toolkit download failed."
+          }
+
+          Write-Host "Downloaded:"
+          Get-Item $file |
+            Select-Object Name, Length
+
+      - name: Install Intel Base Toolkit
+        shell: pwsh
+        run: |
+          $file = Join-Path $env:RUNNER_TEMP `
+            "w_BaseKit_p_2024.2.0.635_offline.exe"
+
+          Write-Host "Installing Intel Base Toolkit..."
+
+          $args = @(
+            "-s",
+            "-a",
+            "--silent",
+            "--eula",
+            "accept"
+          )
+
+          & $file @args
+
+          if ($LASTEXITCODE -notin @(0, 3010)) {
+            throw "Intel Base Toolkit installation failed: $LASTEXITCODE"
+          }
+
+          Write-Host "Base Toolkit installation completed."
+
+      - name: Install Intel HPC Toolkit
+        shell: pwsh
+        run: |
+          $file = Join-Path $env:RUNNER_TEMP `
+            "w_HPCKit_p_2024.2.0.633_offline.exe"
+
+          Write-Host "Installing Intel HPC Toolkit..."
+
+          $args = @(
+            "-s",
+            "-a",
+            "--silent",
+            "--eula",
+            "accept"
+          )
+
+          & $file @args
+
+          if ($LASTEXITCODE -notin @(0, 3010)) {
+            throw "Intel HPC Toolkit installation failed: $LASTEXITCODE"
+          }
+
+          Write-Host "HPC Toolkit installation completed."
+
+      - name: Verify Intel Fortran and MPI
+        shell: cmd
+        run: |
+          @echo on
+
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 vs2022
+
+          if errorlevel 1 exit /b 1
+
+          echo.
+          echo ===== INTEL FORTRAN =====
+
+          where ifx
+          ifx --version
+
+          if errorlevel 1 exit /b 1
+
+          echo.
+          echo ===== INTEL MPI =====
+
+          where mpiexec
+          mpiexec -version
+
+          if errorlevel 1 exit /b 1
+
+      - name: Verify Intel oneMKL
+        shell: pwsh
+        run: |
+          $root = "C:\Program Files (x86)\Intel\oneAPI\mkl"
+
+          $candidates = @(
+            "$root\latest\include\mkl.h",
+            "$root\2024.2\include\mkl.h"
+          )
+
+          $header = $candidates |
+            Where-Object { Test-Path $_ } |
+            Select-Object -First 1
+
+          if (!$header) {
+            throw "Intel oneMKL header mkl.h not found."
+          }
+
+          Write-Host "oneMKL header: $header"
+
+          $setvars = `
+            "C:\Program Files (x86)\Intel\oneAPI\setvars.bat"
+
+          if (!(Test-Path $setvars)) {
+            throw "Intel oneAPI setvars.bat missing."
+          }
+
+          Write-Host "Intel oneAPI environment available."
+
+      - name: Cleanup Downloaded Installers
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item `
+            "$env:RUNNER_TEMP\w_BaseKit_p_2024.2.0.635_offline.exe" `
+            -Force -ErrorAction SilentlyContinue
+
+          Remove-Item `
+            "$env:RUNNER_TEMP\w_HPCKit_p_2024.2.0.633_offline.exe" `
+            -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Installer cleanup completed."
