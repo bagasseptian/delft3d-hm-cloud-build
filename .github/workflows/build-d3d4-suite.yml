@@ -1,0 +1,403 @@
+
+name: Delft3D 4 Unified HM Kernel Package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Unified Delft3D 4 Suite
+    runs-on: windows-2022
+    timeout-minutes: 360
+
+    steps:
+
+      # ======================================
+      # 1. PREFLIGHT
+      # ======================================
+      - name: Check Windows Cloud
+        shell: pwsh
+        run: |
+          $disk = Get-CimInstance Win32_LogicalDisk `
+            -Filter "DeviceID='C:'"
+
+          $free = [math]::Round(
+            $disk.FreeSpace / 1GB, 2
+          )
+
+          Write-Host "Free disk: $free GB"
+
+          if ($free -lt 35) {
+            throw "Insufficient cloud disk space."
+          }
+
+          cmake --version
+          python --version
+          git --version
+
+          $vswhere = Join-Path `
+            ${env:ProgramFiles(x86)} `
+            "Microsoft Visual Studio/Installer/vswhere.exe"
+
+          if (!(Test-Path $vswhere)) {
+            throw "Visual Studio detection tool missing."
+          }
+
+          $vsPath = & $vswhere -latest -products '*' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+
+          if (!$vsPath) {
+            throw "Visual Studio C++ tools missing."
+          }
+
+          Write-Host "Visual Studio: $vsPath"
+
+          "VS_PATH=$vsPath" |
+            Out-File -FilePath $env:GITHUB_ENV `
+            -Append -Encoding utf8
+
+          New-Item -ItemType Directory -Force `
+            "$env:RUNNER_TEMP\intel-logs" |
+            Out-Null
+
+      # ======================================
+      # 2. CHECKOUT EXACT DELTARES REVISION
+      # ======================================
+      - name: Checkout Deltares Source
+        uses: actions/checkout@v7
+        with:
+          repository: Deltares/Delft3D
+          ref: 5a4649830b1e5072caf019fb4850bbdefd9ad431
+          path: Delft3D
+          fetch-depth: 1
+
+      - name: Verify Source Revision
+        shell: pwsh
+        run: |
+          Set-Location "$env:GITHUB_WORKSPACE\Delft3D"
+
+          $expected = "5a4649830b1e5072caf019fb4850bbdefd9ad431"
+          $actual = (git rev-parse HEAD).Trim()
+
+          Write-Host "Expected: $expected"
+          Write-Host "Actual: $actual"
+
+          if ($actual -ne $expected) {
+            throw "Incorrect Deltares revision."
+          }
+
+          if (!(Test-Path ".\build.bat")) {
+            throw "build.bat missing."
+          }
+
+      # ======================================
+      # 3. DOWNLOAD INTEL BASE TOOLKIT
+      # ======================================
+      - name: Download Intel Base Toolkit
+        shell: pwsh
+        run: |
+          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/e83a8e64-04fc-45df-85c6-c2208d03bdb5/w_BaseKit_p_2024.2.0.635_offline.exe"
+
+          $file = "$env:RUNNER_TEMP\basekit.exe"
+
+          curl.exe -L --fail --retry 3 `
+            -o $file $url
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Base Toolkit download failed."
+          }
+
+          Get-Item $file |
+            Select-Object Name, Length
+
+      # ======================================
+      # 4. DOWNLOAD INTEL HPC TOOLKIT
+      # ======================================
+      - name: Download Intel HPC Toolkit
+        shell: pwsh
+        run: |
+          $url = "https://registrationcenter-download.intel.com/akdlm/IRC_NAS/0d500705-397e-41b3-8b2b-2a3da1753fc2/w_HPCKit_p_2024.2.0.633_offline.exe"
+
+          $file = "$env:RUNNER_TEMP\hpckit.exe"
+
+          curl.exe -L --fail --retry 3 `
+            -o $file $url
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "HPC Toolkit download failed."
+          }
+
+          Get-Item $file |
+            Select-Object Name, Length
+
+      # ======================================
+      # 5. INSTALL INTEL MKL
+      # ======================================
+      - name: Install Intel oneMKL
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\basekit.exe"
+          $log = "$env:RUNNER_TEMP\intel-logs\base"
+
+          $installerArgs = @(
+            "-s",
+            "-a",
+            "--silent",
+            "--eula",
+            "accept",
+            "--action",
+            "install",
+            "--components",
+            "intel.oneapi.win.mkl.devel"
+          )
+
+          $proc = Start-Process `
+            -FilePath $exe `
+            -ArgumentList $installerArgs `
+            -Wait `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput "$log-out.txt" `
+            -RedirectStandardError "$log-error.txt"
+
+          Write-Host "Base exit: $($proc.ExitCode)"
+
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            throw "Intel oneMKL installation failed."
+          }
+
+      # ======================================
+      # 6. INSTALL INTEL FORTRAN + MPI
+      # ======================================
+      - name: Install Intel Fortran and MPI
+        shell: pwsh
+        run: |
+          $exe = "$env:RUNNER_TEMP\hpckit.exe"
+          $log = "$env:RUNNER_TEMP\intel-logs\hpc"
+
+          $components = "intel.oneapi.win.mpi.devel:intel.oneapi.win.ifort-compiler"
+
+          $installerArgs = @(
+            "-s",
+            "-a",
+            "--silent",
+            "--eula",
+            "accept",
+            "--action",
+            "install",
+            "--components",
+            $components
+          )
+
+          $proc = Start-Process `
+            -FilePath $exe `
+            -ArgumentList $installerArgs `
+            -Wait `
+            -PassThru `
+            -NoNewWindow `
+            -RedirectStandardOutput "$log-out.txt" `
+            -RedirectStandardError "$log-error.txt"
+
+          Write-Host "HPC exit: $($proc.ExitCode)"
+
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            throw "Intel Fortran/MPI installation failed."
+          }
+
+      # ======================================
+      # 7. VERIFY TOOLCHAIN
+      # ======================================
+      - name: Verify Intel Toolchain
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 vs2022
+
+          if errorlevel 1 exit /b 1
+
+          set "ONEAPI_ROOT=C:\Program Files (x86)\Intel\oneAPI"
+          set "IFORT_COMPILER24=%ONEAPI_ROOT%\compiler\latest"
+          set "I_MPI_ONEAPI_ROOT=%ONEAPI_ROOT%\mpi\latest"
+          set "VS2022INSTALLDIR=%VS_PATH%"
+
+          echo ===== IFX =====
+          where ifx
+
+          if errorlevel 1 exit /b 1
+
+          cd /d "%RUNNER_TEMP%"
+
+          > hello.f90 echo program hello
+          >> hello.f90 echo print *, "IFX_COMPILE_OK"
+          >> hello.f90 echo end program hello
+
+          ifx hello.f90
+
+          if errorlevel 1 exit /b 1
+
+          hello.exe
+
+          if errorlevel 1 exit /b 1
+
+          echo ===== MPI =====
+          where mpiexec
+          if errorlevel 1 exit /b 1
+
+          mpiexec -version
+
+          if errorlevel 1 exit /b 1
+
+      - name: Verify Intel MKL
+        shell: pwsh
+        run: |
+          $root = "C:\Program Files (x86)\Intel\oneAPI\mkl"
+
+          $header = Get-ChildItem `
+            -Path $root `
+            -Filter "mkl.h" `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          if (!$header) {
+            throw "Intel MKL header missing."
+          }
+
+          Write-Host "MKL verified: $($header.FullName)"
+
+      # ======================================
+      # 8. BUILD UNIFIED DELFT3D 4 SUITE
+      # ======================================
+      - name: Build Delft3D 4 Suite
+        shell: cmd
+        run: |
+          echo ===== INITIALIZE INTEL ONEAPI =====
+
+          call "C:\Program Files (x86)\Intel\oneAPI\setvars.bat" intel64 vs2022
+
+          if errorlevel 1 exit /b 1
+
+          set "ONEAPI_ROOT=C:\Program Files (x86)\Intel\oneAPI"
+          set "IFORT_COMPILER24=%ONEAPI_ROOT%\compiler\latest"
+          set "IFX_COMPILER24=%ONEAPI_ROOT%\compiler\latest"
+          set "I_MPI_ONEAPI_ROOT=%ONEAPI_ROOT%\mpi\latest"
+          set "VS2022INSTALLDIR=%VS_PATH%"
+
+          echo IFORT_COMPILER24=%IFORT_COMPILER24%
+          echo VS2022INSTALLDIR=%VS2022INSTALLDIR%
+
+          if not exist "%IFORT_COMPILER24%\bin\ifx.exe" (
+            echo Intel Fortran missing.
+            exit /b 1
+          )
+
+          cd /d "%GITHUB_WORKSPACE%\Delft3D"
+
+          set "CMAKE_BUILD_PARALLEL_LEVEL=1"
+
+          echo ===== BUILD CONFIGURATION: D3D4-SUITE =====
+
+          call build.bat -config d3d4-suite -build_type Release -compiler ifx -vs 2022 -build
+
+          if errorlevel 1 (
+            echo DELFT3D 4 SUITE BUILD FAILED
+            exit /b 1
+          )
+
+          echo DELFT3D 4 SUITE BUILD COMMAND COMPLETED
+
+      # ======================================
+      # 9. VALIDATE UNIFIED INSTALLATION
+      # ======================================
+      - name: Validate Unified Kernel Package
+        shell: pwsh
+        run: |
+          $root = "$env:GITHUB_WORKSPACE\Delft3D\install_d3d4-suite"
+
+          if (!(Test-Path $root)) {
+            throw "install_d3d4-suite directory missing."
+          }
+
+          foreach ($dir in @("bin", "lib", "share")) {
+            $path = Join-Path $root $dir
+
+            if (!(Test-Path $path)) {
+              throw "Required folder missing: $dir"
+            }
+
+            Write-Host "FOUND: $dir"
+          }
+
+          $requiredFiles = @(
+            "d_hydro.exe",
+            "flow2d3d.dll",
+            "wave.exe"
+          )
+
+          foreach ($name in $requiredFiles) {
+            $found = Get-ChildItem `
+              -Path $root `
+              -Filter $name `
+              -Recurse `
+              -File |
+              Select-Object -First 1
+
+            if (!$found) {
+              throw "Required runtime missing: $name"
+            }
+
+            Write-Host "FOUND: $($found.FullName)"
+          }
+
+          $summary = "$env:RUNNER_TEMP\d3d4-suite-summary.txt"
+
+          "DELFT3D 4 UNIFIED PACKAGE" |
+            Set-Content $summary
+
+          "SOURCE: 5a4649830b1e5072caf019fb4850bbdefd9ad431" |
+            Add-Content $summary
+
+          Get-ChildItem $root -Recurse -File |
+            Select-Object FullName, Length |
+            Format-Table -AutoSize |
+            Out-String |
+            Add-Content $summary
+
+          Write-Host "Unified package validation completed."
+
+          Get-Content $summary -TotalCount 50
+
+      # ======================================
+      # 10. UPLOAD COMPLETE PACKAGE
+      # ======================================
+      - name: Upload Unified Delft3D Kernel
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: delft3d-40702-unified-kernels
+          path: |
+            Delft3D/install_d3d4-suite/
+            Delft3D/build_d3d4-suite/*.log
+            Delft3D/build_d3d4-suite/CMakeCache.txt
+            ${{ runner.temp }}/intel-logs/
+            ${{ runner.temp }}/d3d4-suite-summary.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      # ======================================
+      # 11. CLEANUP
+      # ======================================
+      - name: Cleanup Intel Installers
+        if: always()
+        shell: pwsh
+        run: |
+          Remove-Item "$env:RUNNER_TEMP\basekit.exe" `
+            -Force -ErrorAction SilentlyContinue
+
+          Remove-Item "$env:RUNNER_TEMP\hpckit.exe" `
+            -Force -ErrorAction SilentlyContinue
+
+          Write-Host "Cleanup completed."
